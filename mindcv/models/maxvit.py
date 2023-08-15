@@ -1,10 +1,14 @@
 from mindspore import Tensor
 from mindspore import nn
+from mindspore import Parameter
 from mindspore.nn import CellList
 from mindspore.ops import operations as P
 from mindspore.ops import functional as F
 from mindspore.common.initializer import Normal
+import mindspore.numpy as mnp
+import mindspore
 
+from .registry import register_model
 # helpers
 __all__ = [
     "MaxViT",
@@ -50,7 +54,7 @@ def cast_tuple(val, length = 1):
 class PreNormResidual(nn.Cell):
     def __init__(self, dim, fn):
         super().__init__()
-        self.norm = nn.LayerNorm(dim)
+        self.norm = nn.LayerNorm((dim,))
         self.fn = fn
 
     def construct(self, x):
@@ -75,16 +79,17 @@ class SqueezeExcitation(nn.Cell):
         hidden_dim = int(dim * shrinkage_rate)
 
         self.gate = nn.SequentialCell([
-            P.ReduceMean(keep_dims=False),
             nn.Dense(dim, hidden_dim, has_bias=False),
             nn.SiLU(),
             nn.Dense(hidden_dim, dim, has_bias=False),
-            nn.Sigmoid(),
-            P.Reshape()
+            nn.Sigmoid()
         ])
 
     def construct(self, x):
-        return x * self.gate(x)
+        y = P.ReduceMean()(x, (2,3))
+        y = self.gate(y)
+        y = P.Reshape()(y, (y.shape[0], y.shape[1], 1, 1))
+        return x * y
 
 
 class MBConvResidual(nn.Cell):
@@ -128,7 +133,7 @@ def MBConv(
         nn.Conv2d(dim_in, hidden_dim, 1),
         nn.BatchNorm2d(hidden_dim),
         nn.GELU(),
-        nn.Conv2d(hidden_dim, hidden_dim, 3, stride = stride, padding = 1, group = hidden_dim),
+        nn.Conv2d(hidden_dim, hidden_dim, 3, stride = stride, padding = 1, group = hidden_dim, pad_mode = 'pad'),
         nn.BatchNorm2d(hidden_dim),
         nn.GELU(),
         SqueezeExcitation(hidden_dim, shrinkage_rate = shrinkage_rate),
@@ -159,7 +164,7 @@ class Attention(nn.Cell):
         self.to_qkv = nn.Dense(dim, dim * 3, has_bias=False)
 
         self.attend = nn.SequentialCell([
-            P.Softmax(axis = -1),
+            nn.Softmax(axis = -1),
             nn.Dropout(dropout)
         ])
 
@@ -172,36 +177,61 @@ class Attention(nn.Cell):
 
         pos = mnp.arange(window_size)
         grid = mnp.stack(mnp.meshgrid(pos, pos, indexing = 'ij'))
-        grid = P.Reshape()(grid, 'c i j -> (i j) c')
-        rel_pos = P.Reshape()(grid, 'i ... -> i 1 ...') - P.Reshape()(grid, 'j ... -> 1 j ...')
+        grid = grid.transpose((1,2,0))
+        grid = grid.reshape((-1, grid.shape[2]))
+        grid_1 = grid.reshape((grid.shape[0], 1, grid.shape[1]))
+        grid_2 = grid.reshape((1, grid.shape[0], grid.shape[1]))
+        rel_pos = grid_1 - grid_2
         rel_pos += window_size - 1
-        rel_pos_indices = (rel_pos * mnp.array([2 * window_size - 1, 1])).sum(axis = -1)
+        rel_pos_indices = (rel_pos * Tensor([2 * window_size - 1, 1]).astype(mindspore.float32)).sum(axis = -1).astype(mindspore.int64)
 
         self.rel_pos_indices = Parameter(rel_pos_indices, name='rel_pos_indices')
 
-    def construct(self, x):
-        batch, height, width, window_height, window_width, _, device, h = *x.shape, x.device, self.heads
-        x = P.Reshape()(x, 'b x y w1 w2 d -> (b x y) (w1 w2) d')
-        q, k, v = self.to_qkv(x).split(3, axis = -1)
-        q, k, v = map(lambda t: P.Reshape()(t, 'b n (h d ) -> b h n d', h = h), (q, k, v))
+    def construct(self, p):
+        batch, height, width, window_height, window_width, _ = p.shape
+        h = self.heads
+        b,x,y,w1,w2,d = p.shape
+        p = p.reshape((b*x*y, w1*w2,d))
+        q, k, v = self.to_qkv(p).split(-1, 3)
+        q = q.reshape((q.shape[0], q.shape[1], h, -1)).transpose((0,2,1,3))
+        k = k.reshape((k.shape[0], k.shape[1], h, -1)).transpose((0,2,1,3))
+        v = v.reshape((v.shape[0], v.shape[1], h, -1)).transpose((0,2,1,3))
         q = q * self.scale
-        sim = P.MatMul()(q, k)
+        sim = P.BatchMatMul(transpose_b=True)(q, k)
         bias = self.rel_pos_bias(self.rel_pos_indices)
-        sim = sim + P.Reshape()(bias, 'i j h -> h i j')
+        sim = sim + bias.transpose()
         attn = self.attend(sim)
-        out = P.MatMul()(attn, v)
-        out = P.Reshape()(out, 'b h (w1 w2) d -> b w1 w2 (h d)', w1 = window_height, w2 = window_width)
+        out = P.BatchMatMul()(attn, v)
+        w1, w2 = window_height, window_width
+        out = out.transpose(0,2,1,3)
+        out = out.reshape((out.shape[0], w1, w2, -1))
         out = self.to_out(out)
-        return P.Reshape()(out, '(b x y) ... -> b x y ...', x = height, y = width)
+        out = out.reshape((-1, height, width, w1, w2, out.shape[-1]))
+        return out
 
+class Rearrange_1(nn.Cell):
+    def __init__(self, w):
+        super().__init__()
+        self.w = w
 
+    def construct(self, x):
+        b,d,a,c = x.shape
+        x = x.reshape((b,d, a//self.w, self.w, c//self.w, self.w))
+        return x.transpose((0, 2, 4, 3, 5, 1))
 
+class Rearrange_2(nn.Cell):
+    def __init__(self):
+        super().__init__()
+
+    def construct(self, t):
+        b,x,y,w1,w2,d = t.shape
+        t = t.transpose((0 ,5, 3, 1, 4, 2))
+        return t.reshape((b,d, w1*x, w2*y))
 class MaxViT(nn.Cell):
     def __init__(
         self,
         *,
         num_classes,
-        dim,
         num_blocks,
         num_channels,
         dim_head = 32,
@@ -217,19 +247,18 @@ class MaxViT(nn.Cell):
 
         # convolutional stem
 
-        dim_conv_stem = default(dim_conv_stem, dim)
 
         self.conv_stem = nn.SequentialCell([
-            nn.Conv2d(channels, dim_conv_stem, 3, stride = 2, padding = 1),
-            nn.Conv2d(dim_conv_stem, dim_conv_stem, 3, padding = 1)
+            nn.Conv2d(channels, dim_conv_stem, 3, stride = 2, padding = 1, pad_mode='pad'),
+            nn.Conv2d(dim_conv_stem, dim_conv_stem, 3, padding = 1, pad_mode='pad')
         ])
 
         # variables
 
-        num_stages = len(num_blocks)
 
+        num_stages = len(num_blocks) - 1
+        num_blocks = num_blocks[1:]
         dims = tuple(num_channels)
-        dims = (dim_conv_stem, *dims)
         dim_pairs = tuple(zip(dims[:-1], dims[1:]))
 
         self.layers = CellList([])
@@ -253,15 +282,16 @@ class MaxViT(nn.Cell):
                         expansion_rate = mbconv_expansion_rate,
                         shrinkage_rate = mbconv_shrinkage_rate
                     ),
-                    Rearrange('b d (x w1) (y w2) -> b x y w1 w2 d', w1 = w, w2 = w),  # block-like attention
-                    PreNormResidual(layer_dim, Attention(dim = layer_dim, dim_head = dim_head, dropout = dropout, window_size = w)),
-                    PreNormResidual(layer_dim, FeedForward(dim = layer_dim, dropout = dropout)),
-                    Rearrange('b x y w1 w2 d -> b d (x w1) (y w2)'),
 
-                    Rearrange('b d (w1 x) (w2 y) -> b x y w1 w2 d', w1 = w, w2 = w),  # grid-like attention
+                    Rearrange_1(w),  # block-like attention
                     PreNormResidual(layer_dim, Attention(dim = layer_dim, dim_head = dim_head, dropout = dropout, window_size = w)),
                     PreNormResidual(layer_dim, FeedForward(dim = layer_dim, dropout = dropout)),
-                    Rearrange('b x y w1 w2 d -> b d (w1 x) (w2 y)'),
+                    Rearrange_2(),
+
+                    Rearrange_1(w),  # grid-like attention
+                    PreNormResidual(layer_dim, Attention(dim = layer_dim, dim_head = dim_head, dropout = dropout, window_size = w)),
+                    PreNormResidual(layer_dim, FeedForward(dim = layer_dim, dropout = dropout)),
+                    Rearrange_2(),
                 ])
 
                 self.layers.append(block)
@@ -269,17 +299,16 @@ class MaxViT(nn.Cell):
         # mlp head out
 
         self.mlp_head = nn.SequentialCell([
-            P.ReduceMean(keep_dims=False),
-            nn.LayerNorm(dims[-1]),
+            nn.LayerNorm((dims[-1],)),
             nn.Dense(dims[-1], num_classes)
         ])
 
     def construct(self, x):
         x = self.conv_stem(x)
-
         for stage in self.layers:
             x = stage(x)
-
+        x = P.ReduceMean(keep_dims=False)(x, (2,3))
+        assert len(x.shape) == 2
         return self.mlp_head(x)
 
 @register_model
@@ -289,7 +318,7 @@ def maxvit_t(pretrained: bool = False, num_classes: int = 1000, in_channels: int
     """
     default_cfg = default_cfgs["maxvit_t"]
     model = MaxViT( num_classes=num_classes,
-                   num_heads=4, num_blocks=(2,2,2,5,2), num_channels=(64,64,128,256,512), dim_conv_stem=64, embed_dim=192, dropout=0.2, **kwargs)
+                   num_blocks=(2,2,2,5,2), num_channels=(64,64,128,256,512), dim_conv_stem=64, dropout=0.2, **kwargs)
 
     if pretrained:
         load_pretrained(model, default_cfg, num_classes=num_classes, in_channels=in_channels)
@@ -303,7 +332,7 @@ def maxvit_s(pretrained: bool = False, num_classes: int = 1000, in_channels: int
     """
     default_cfg = default_cfgs["maxvit_s"]
     model = MaxViT( num_classes=num_classes,
-                   num_heads=4, num_blocks=(2,2,2,5,2), num_channels=(64,96,192,384,768), dim_conv_stem=64, embed_dim=192,  dropout=0.3, **kwargs)
+                   num_blocks=(2,2,2,5,2), num_channels=(64,96,192,384,768), dim_conv_stem=64, dropout=0.3, **kwargs)
 
     if pretrained:
         load_pretrained(model, default_cfg, num_classes=num_classes, in_channels=in_channels)
@@ -317,7 +346,7 @@ def maxvit_b(pretrained: bool = False, num_classes: int = 1000, in_channels: int
     """
     default_cfg = default_cfgs["maxvit_b"]
     model = MaxViT( num_classes=num_classes,
-                   num_heads=4, num_blocks=(2,2,6,14,2), num_channels=(64,96,192,984,768), dim_conv_stem=64, embed_dim=192,  dropout=0.4,**kwargs)
+                   num_blocks=(2,2,6,14,2), num_channels=(64,96,192,984,768), dim_conv_stem=64,  dropout=0.4,**kwargs)
 
     if pretrained:
         load_pretrained(model, default_cfg, num_classes=num_classes, in_channels=in_channels)
@@ -331,7 +360,7 @@ def maxvit_l(pretrained: bool = False, num_classes: int = 1000, in_channels: int
     """
     default_cfg = default_cfgs["maxvit_l"]
     model = MaxViT( num_classes=num_classes,
-                   num_heads=4, num_blocks=(2,2,6,14,2), num_channels=(128,128,256,512,1024), dim_conv_stem=64, embed_dim=192, dropout=0.6, **kwargs)
+                   num_blocks=(2,2,6,14,2), num_channels=(128,128,256,512,1024), dim_conv_stem=128,  dropout=0.6, **kwargs)
 
     if pretrained:
         load_pretrained(model, default_cfg, num_classes=num_classes, in_channels=in_channels)
@@ -343,9 +372,9 @@ def maxvit_xl(pretrained: bool = False, num_classes: int = 1000, in_channels: in
     """Get MaxViT tiny model
     Refer to the base class "models.MaxViT" for more details.
     """
-    default_cfg = default_cfgs["maxvit_t"]
+    default_cfg = default_cfgs["maxvit_xl"]
     model = MaxViT( num_classes=num_classes,
-                   num_heads=4, num_blocks=(2,2,6,14,2), num_channels=(192,192,384,768,1024), dim_conv_stem=64, embed_dim=192, dropout=0.6, **kwargs)
+                   num_blocks=(2,2,6,14,2), num_channels=(192,192,384,768,1024), dim_conv_stem=192,dropout=0.6, **kwargs)
 
     if pretrained:
         load_pretrained(model, default_cfg, num_classes=num_classes, in_channels=in_channels)
