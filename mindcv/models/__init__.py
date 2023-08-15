@@ -17,6 +17,7 @@ from . import (
     inceptionv3,
     inceptionv4,
     layers,
+    maxvit,
     mixnet,
     mlpmixer,
     mnasnet,
@@ -72,6 +73,7 @@ from .hrnet import *
 from .inceptionv3 import *
 from .inceptionv4 import *
 from .layers import *
+from .maxvit import *
 from .mixnet import *
 from .mlpmixer import *
 from .mnasnet import *
@@ -129,6 +131,7 @@ __all__.extend(hrnet.__all__)
 __all__.extend(["InceptionV3", "inception_v3"])
 __all__.extend(["InceptionV4", "inception_v4"])
 __all__.extend(layers.__all__)
+__all__.extend(maxvit.__all__)
 __all__.extend(mixnet.__all__)
 __all__.extend(mlpmixer.__all__)
 __all__.extend(mnasnet.__all__)
